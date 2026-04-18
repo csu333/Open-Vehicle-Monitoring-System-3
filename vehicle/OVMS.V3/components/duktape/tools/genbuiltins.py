@@ -1025,7 +1025,7 @@ def dump_metadata(meta, fn):
 def load_metadata(opts, rom=False, build_info=None, active_opts=None):
     # Load built-in strings and objects.
     with open(opts.strings_metadata, 'rb') as f:
-        strings_metadata = recursive_strings_to_bytes(yaml.load(f))
+        strings_metadata = recursive_strings_to_bytes(yaml.safe_load(f))
     with open(opts.objects_metadata, 'rb') as f:
         objects_metadata = recursive_strings_to_bytes(yaml.load(f))
 
