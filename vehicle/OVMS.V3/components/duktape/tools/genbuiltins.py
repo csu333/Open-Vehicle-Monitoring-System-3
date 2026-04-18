@@ -1114,7 +1114,7 @@ def load_metadata(opts, rom=False, build_info=None, active_opts=None):
         for fn in opts.builtin_files:
             # XXX: awkward second pass
             with open(fn, 'rb') as f:
-                user_meta = recursive_strings_to_bytes(yaml.load(f))
+                user_meta = recursive_strings_to_bytes(yaml.safe_load(f))
                 metadata_normalize_missing_strings(meta, user_meta)
         metadata_normalize_missing_strings(meta, {})  # in case no files
 
