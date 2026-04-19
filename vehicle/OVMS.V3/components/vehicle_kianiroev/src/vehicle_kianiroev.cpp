@@ -103,6 +103,7 @@ static const OvmsPoller::poll_pid_t vehicle_kianiroev_polls[] =
 		//{ 0x7b3, 0x7bb, VEHICLE_POLL_TYPE_OBDIIEXTENDED,  	0x0102, 		{       0,   10,  10 } },  // AirCon - No usable values found yet
 		{ 0x7c6, 0x7ce, VEHICLE_POLL_TYPE_OBDIIEXTENDED,  	0xA020, 		{       0,   19, 120 }, 0, ISOTP_STD },  // Cluster. ODO
 		{ 0x7c6, 0x7ce, VEHICLE_POLL_TYPE_OBDIIEXTENDED,  	0xB002, 		{       0,   19, 120 }, 0, ISOTP_STD },  // Cluster. ODO
+		{ 0x7c6, 0x7ce, VEHICLE_POLL_TYPE_OBDIIEXTENDED,  	0xB003, 		{       0,   19, 120 }, 0, ISOTP_STD },  // Remaining autonomy?
 
 		{ 0x7d1, 0x7d9, VEHICLE_POLL_TYPE_OBDIIEXTENDED,  	0xc101, 		{       0,   27,  27 }, 0, ISOTP_STD },  // ABS/ESP - Emergency lights
 

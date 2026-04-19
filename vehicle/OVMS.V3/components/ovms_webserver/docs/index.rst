@@ -36,8 +36,15 @@ Read the source and install them as plugins (see below) to see how they work.
 
 .. toctree::
    :maxdepth: 1
+   :caption: Built-in tools
+
+   canmonitor
+   bms-cell-monitor
+
+.. toctree::
+   :maxdepth: 1
    :caption: Plugin examples
-   
+
    regenmon
    dashboard
    plugin-twizy/dashboard-tuneslider

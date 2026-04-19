@@ -110,6 +110,10 @@ OvmsWebServer::OvmsWebServer()
   RegisterPage("/status", "Status", HandleStatus, PageMenu_Main, PageAuth_Cookie);
   RegisterPage("/shell", "Shell", HandleShell, PageMenu_Tools, PageAuth_Cookie);
   RegisterPage("/edit", "Editor", HandleEditor, PageMenu_Tools, PageAuth_Cookie);
+
+  // CAN frame monitor
+  RegisterPage("/canmonitor", "CAN Monitor", HandleCanMonitor, PageMenu_Tools, PageAuth_Cookie);
+  RegisterPage("/api/canmonitor", "CAN Monitor Data", HandleCanMonitorData, PageMenu_None, PageAuth_Cookie);
 #ifdef WEBSRV_HAVE_SETUPWIZARD
   RegisterPage("/cfg/init", "Setup wizard", HandleCfgInit, PageMenu_None, PageAuth_Cookie);
 #endif
@@ -543,9 +547,21 @@ void OvmsWebServer::EventHandler(mg_connection *nc, int ev, void *p)
   // framework handling:
   switch (ev)
   {
+    case MG_EV_WEBSOCKET_HANDSHAKE_REQUEST: // websocket upgrade request — URI available
+      {
+        http_message* hm = (http_message*) p;
+        std::string uri(hm->uri.p, hm->uri.len);
+        if (uri == "/ws/canmonitor")
+          MyWebServer.CreateCanMonWsHandler(nc, hm);
+      }
+      break;
+
     case MG_EV_WEBSOCKET_HANDSHAKE_DONE:    // new websocket connection
       {
-        MyWebServer.CreateWebSocketHandler(nc);
+        // Only create the standard metrics handler when no custom handler
+        // was already attached during HANDSHAKE_REQUEST (nc->user_data == NULL).
+        if (nc->user_data == NULL)
+          MyWebServer.CreateWebSocketHandler(nc);
       }
       break;
 

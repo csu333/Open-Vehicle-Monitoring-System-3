@@ -3,7 +3,7 @@ set(include_dirs)
 set(embedded_files "assets/script.js.gz" "assets/charts.js.gz" "assets/tables.js.gz" "assets/style.css.gz" "assets/zones.json.gz" "assets/favicon.png")
 
 if (CONFIG_OVMS_SC_GPL_MONGOOSE AND CONFIG_OVMS_COMP_WEBSERVER)
-  list(APPEND srcs "src/ovms_commandstream.cpp" "src/ovms_webserver.cpp" "src/ovms_websockethandler.cpp" "src/web_cfg.cpp" "src/web_cfg_init.cpp" "src/web_displays.cpp" "src/web_framework.cpp")
+  list(APPEND srcs "src/ovms_commandstream.cpp" "src/ovms_webserver.cpp" "src/ovms_websockethandler.cpp" "src/web_canmonitor.cpp" "src/web_cfg.cpp" "src/web_cfg_init.cpp" "src/web_displays.cpp" "src/web_framework.cpp")
   list(APPEND include_dirs "src" "assets")
 endif ()
 
@@ -11,7 +11,7 @@ endif ()
 idf_component_register(SRCS ${srcs}
                        INCLUDE_DIRS ${include_dirs}
                        REQUIRES "pushover" "mongoose" "ovms_plugins"
-                       PRIV_REQUIRES "main"
+                       PRIV_REQUIRES "main" "retools" "retools_pidscan" "dbc"
                        EMBED_FILES ${embedded_files}
                        WHOLE_ARCHIVE)
 

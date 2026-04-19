@@ -554,6 +554,9 @@ class OvmsWebServer : public ExternalRamAllocated
     static void HandleShell(PageEntry_t& p, PageContext_t& c);
     static void HandleDashboard(PageEntry_t& p, PageContext_t& c);
     static void HandleBmsCellMonitor(PageEntry_t& p, PageContext_t& c);
+    static void HandleCanMonitor(PageEntry_t& p, PageContext_t& c);
+    static void HandleCanMonitorData(PageEntry_t& p, PageContext_t& c);
+    static void CreateCanMonWsHandler(mg_connection* nc, http_message* hm);
     static void HandleCfgBrakelight(PageEntry_t& p, PageContext_t& c);
     static void HandleEditor(PageEntry_t& p, PageContext_t& c);
     static void HandleCfgPassword(PageEntry_t& p, PageContext_t& c);

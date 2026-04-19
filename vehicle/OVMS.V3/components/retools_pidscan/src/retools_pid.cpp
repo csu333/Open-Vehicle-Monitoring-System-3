@@ -280,6 +280,11 @@ void scanStop(int, OvmsWriter* writer, OvmsCommand*, int, const char* const*)
 
 }  // anon namespace
 
+int OvmsReToolsPidScannerCurrentPid()
+{
+    return s_scanner ? s_scanner->Current() : -1;
+}
+
 OvmsReToolsPidScanner::OvmsReToolsPidScanner(
         canbus* bus, uint16_t ecu, uint16_t rxid_low, uint16_t rxid_high,
         uint8_t polltype, int start, int end, int step, uint8_t timeout) :

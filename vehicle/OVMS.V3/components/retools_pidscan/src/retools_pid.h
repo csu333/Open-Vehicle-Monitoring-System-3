@@ -109,4 +109,7 @@ class OvmsReToolsPidScanner
     mutable OvmsMutex m_foundMutex;
 };
 
+// Returns the PID currently being scanned, or -1 if no scan is active.
+int OvmsReToolsPidScannerCurrentPid();
+
 #endif  // __RE_TOOLS_PID_H__
