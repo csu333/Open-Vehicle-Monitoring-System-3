@@ -1027,7 +1027,7 @@ def load_metadata(opts, rom=False, build_info=None, active_opts=None):
     with open(opts.strings_metadata, 'rb') as f:
         strings_metadata = recursive_strings_to_bytes(yaml.safe_load(f))
     with open(opts.objects_metadata, 'rb') as f:
-        objects_metadata = recursive_strings_to_bytes(yaml.load(f))
+        objects_metadata = recursive_strings_to_bytes(yaml.safe_load(f))
 
     # Merge strings and objects metadata as simple top level key merge.
     meta = {}
