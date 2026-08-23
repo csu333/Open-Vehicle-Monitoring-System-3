@@ -30,6 +30,7 @@
 #ifndef __CONSOLE_H__
 #define __CONSOLE_H__
 
+#include <list>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "ovms_shell.h"
@@ -56,16 +57,16 @@ class OvmsConsole : public OvmsShell
     typedef enum
       {
       RECV = 0x10000,
-      ALERT,
-      ALERT_MULTI
+      ALERT,                // String alert (single C-string to single console) [DEPRECATED,UNUSED]
+      ALERT_MULTI,          // LogBuffers style alert (multiple C-strings to multiple consoles)
       } event_type_t;
 
     typedef struct
       {
-      event_type_t type;  // Our extended event type enum
+      event_type_t type;    // Our extended event type enum
       union
         {
-        char* buffer;       // Pointer to ALERT buffer
+        char* buffer;       // Pointer to ALERT buffer [DEPRECATED,UNUSED]
         LogBuffers* multi;  // Pointer to ALERT_MULTI message
         ssize_t size;       // Buffer size for RECV
         struct mbuf* mbuf;  // Buffer pointer for RECV with Mongoose
@@ -85,9 +86,15 @@ class OvmsConsole : public OvmsShell
     char** GetCompletions(int &common_len, bool &finished ) override;
     void Log(LogBuffers* message);
     void Poll(portTickType ticks, QueueHandle_t queue = NULL);
+    // Set once the transport is closing: the mongoose connection may already be
+    // freed, so an in-flight write() from a follow-mode task must short-circuit
+    // before dereferencing it. Read cross-task (see ConsoleReaper).
+    void SetClosing() { m_closing = true; }
+    bool IsClosing() { return m_closing; }
 
   protected:
     void Service();
+    void DeleteEventQueue(QueueHandle_t* queuep);
     void finalise();
 
   protected:
@@ -95,16 +102,43 @@ class OvmsConsole : public OvmsShell
 
   protected:
     bool m_ready;
+    volatile bool m_closing;    // true once the transport is closing; read cross-task
     char *m_completions[COMPLETION_MAX_TOKENS+2];
     int m_common;
     char m_space[COMPLETION_MAX_TOKENS+2][TOKEN_MAX_LENGTH];
     bool m_final;
-    QueueHandle_t m_queue;
-    QueueHandle_t m_deferred;
-    int m_discarded;
+    QueueHandle_t m_queue;      // Queue for console specific device events & log messages
+    QueueHandle_t m_deferred;   // Temporary queue for log messages received while InsertCallback active
+    int m_discarded;            // Number of overflows on the deferred queue
     DisplayState m_state;
     unsigned int m_lost;        // Log messages lost due to full queue
     unsigned int m_acked;       // Log messages acknowledged as lost
+  };
+
+// Deferred-teardown support for consoles served over a Mongoose transport
+// (SSH, Telnet). Such a console is deleted from its server's MG_EV_CLOSE
+// handler, which runs holding the Mongoose lock. If an interactive follow-mode
+// task (e.g. "vfs tail") is still bound to the console, its write path needs
+// that same lock, so joining it synchronously from MG_EV_CLOSE deadlocks.
+// ConsoleReaper breaks the cycle: mark the console closing (so its in-flight
+// write bails without touching the about-to-be-freed connection), ask the task
+// to stop, and delete the console later — from the server's MG_EV_POLL handler
+// — once the task has actually exited. A server mixes this in alongside
+// MongooseClient and calls CloseConsole() from MG_EV_CLOSE and ReapConsoles()
+// from MG_EV_POLL.
+class ConsoleReaper
+  {
+  public:
+    // Call from MG_EV_CLOSE. Returns true if the console was queued for deferred
+    // reaping (the caller must NOT delete it); false if no follow-mode task is
+    // bound and the caller should delete it synchronously as before.
+    bool CloseConsole(OvmsConsole* child);
+    // Call from MG_EV_POLL: delete any deferred consoles whose follow-mode task
+    // has now exited.
+    void ReapConsoles();
+
+  protected:
+    std::list<OvmsConsole*> m_reaping;   // consoles awaiting follow-task exit before delete
   };
 
 #endif //#ifndef __CONSOLE_H__

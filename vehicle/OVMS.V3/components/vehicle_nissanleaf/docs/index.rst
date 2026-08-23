@@ -84,6 +84,20 @@ Charge Interruption Alerts  Yes
 
 .. [5] For ZE1 models, a separate 8-wire CAN tap cable and DB9 connector are required. The standard OBD-II to DB9 cable supplied with OVMS cannot be used, as it only has 6 wires. Additionally, the OBD-II port itself cannot be used because the vehicle’s CAN gateway module powers down when the ignition is off, isolating the port from the rest of the vehicle. Instead, you need to build an adapter cable to tap into the CAN buses going to the CAN gateway module located behind the instrument cluster. See the :ref:`2018+ models (ZE1)` for more details.
 
+----------------
+CAN Bus Mapping
+----------------
+
+The Leaf module uses two of the three available OVMS v3 CAN buses.
+
+=========================== ============== ======================================== =================================================================
+OVMS bus                    Leaf bus       Controller                               Function
+=========================== ============== ======================================== =================================================================
+CAN1 (DB9 pins 2 / 7)       EV-CAN         ESP32 internal TWAI/CAN controller       BMS/LBC, motor/inverter, A/C module, pre-2016 TCU/remote commands, wakeup frames
+CAN2 (DB9 pins 4 / 5)       CAR-CAN        MCP2515 #1                               Charger/PDM, VIN, charge counters, lock/unlock, 2016+ TCU/remote commands
+CAN3 (DB9 pins 6 / 8)       IT-CAN         MCP2515 #2                               Instrument cluster / internal bus — not used by the Leaf module
+=========================== ============== ======================================== =================================================================
+
 ----------------------
 Remote Climate Control
 ----------------------
@@ -137,7 +151,9 @@ Note: If you prefer not to unplug the Nissan TCU, all OVMS functions appart from
 2016-2017 LEAF models (ZE0-2)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-**Remote climate control will only work when plugged in and actively charging on LEAF 2016-2017 models.** This is because in 2016 Nissan moved the TCU from the EV CAN bus to the CAR CAN bus.
+To use OVMS to activate remote climate the Nissan TCU (Telematics Control Unit) module must be disconnected from the CAR-CAN bus.  If you remove the TCU completely the hands-free bluetooth microphone won't work.  To retain the hands-free microphone, follow the instructions `here <https://github.com/openvehicles/Open-Vehicle-Monitoring-System-3/blob/master/vehicle/OVMS.V3/components/vehicle_nissanleaf/docs/index.rst#disabling-the-tcu-for-remote-climate-control>`_.
+
+You can re-use the built in GPS and GSM antennas for OVMS using two Fakra Z male to SMA male plug adapters.  Use these adapters to connect the OVMS GPS to the blue Fakra connector on the car and connect the OVMS GSM to the pink Fakra connector on the car.
 
 Set the model year as follows and if necessary configure 30 kWh model:
 

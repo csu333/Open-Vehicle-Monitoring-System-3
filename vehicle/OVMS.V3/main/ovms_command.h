@@ -52,11 +52,12 @@
 #define COMMAND_RESULT_VERBOSE    65535
 
 class OvmsWriter;
+class OvmsCommandTask;
 class OvmsCommand;
 class OvmsCommandMap;
 class LogBuffers;
-typedef std::map<TaskHandle_t, LogBuffers*> PartialLogs;
 typedef bool (*InsertCallback)(OvmsWriter* writer, void* userData, char);
+typedef void (*TerminationCallback)(OvmsWriter* writer, void* userData);
 
 class OvmsWriter
   {
@@ -70,6 +71,7 @@ class OvmsWriter
     virtual ssize_t write(const void *buf, size_t nbyte) { return 0; }
     virtual char** SetCompletion(int index, const char* token, bool isfinal = true) { return NULL; }
     virtual char** GetCompletions(int &common_len, bool &finished ) { return NULL; }
+    virtual void SetCommand(OvmsCommand* cmd) { return; }
     virtual void SetArgv(const char* const* argv) { return; }
     virtual const char* const* GetArgv() { return NULL; }
     virtual void Log(LogBuffers* message) {};
@@ -79,6 +81,28 @@ class OvmsWriter
     void DeregisterInsertCallback(InsertCallback cb);
     virtual void finalise() {}
     virtual void ProcessChar(char c) {}
+
+  public:
+    // Termination handler registry, parallel to the insert callback registry.
+    // An interactive command that has taken over the session input (by
+    // registering an insert callback) may also register a termination handler.
+    // A console invokes RunTerminationCallback() during teardown — before it
+    // frees any transport it owns — so the command can release resources or stop
+    // background tasks while this writer is still valid. At most one handler is
+    // active at a time (input is owned by a single interactive command). The
+    // handler must block until cleanup is complete (e.g. a follow-mode task must
+    // be joined) so the writer is safe to free once it returns.
+    void RegisterTerminationCallback(TerminationCallback cb, void* ctx);
+    void DeregisterTerminationCallback(TerminationCallback cb);
+    void RunTerminationCallback();
+    bool HasTerminationCallback(TerminationCallback cb) { return m_termination == cb; }
+    bool HasFollowModeTask();    // a follow-mode command task is still bound (sentinel test only)
+    bool StopFollowModeTask();   // atomically request a bound follow-mode task to stop; false if none
+
+  public:
+    // Used to notify the writer of a migration of a file within the VFS
+    virtual const std::string GetPath() { return std::string(""); }
+    virtual void SetPath(const std::string& path) {}
 
   public:
     bool IsSecure();
@@ -93,6 +117,12 @@ class OvmsWriter
     InsertCallback m_insert;
     void* m_userData;
     bool m_monitoring;
+    // Both volatile (read/written cross-task); m_termination is the sentinel:
+    // it is set last and cleared last, so whenever it is non-NULL, m_termData
+    // is valid. Teardown-vs-self-exit races are resolved by termination_mux
+    // in ovms_command.cpp.
+    volatile TerminationCallback m_termination;   // active interactive-command teardown handler, or NULL
+    void* volatile m_termData;
   };
 
 template <typename T>
@@ -104,17 +134,17 @@ class NameMap : public std::map<std::string, T>
       size_t len = strlen(token);
       const T* found = NULL;
       for (typename NameMap<T>::const_iterator it = NameMap<T>::begin(); it != NameMap<T>::end(); ++it)
-	{
-	if (it->first.compare(0, len, token) == 0)
-	  {
-	  if (len == it->first.length())
-	    return &it->second;
-	  if (found)
-	    return NULL;
-	  else
-	    found = &it->second;
-	  }
-	}
+        {
+        if (it->first.compare(0, len, token) == 0)
+          {
+          if (len == it->first.length())
+            return &it->second;
+          if (found)
+            return NULL;
+          else
+            found = &it->second;
+          }
+        }
       return found;
       }
 
@@ -141,19 +171,19 @@ class NameMap : public std::map<std::string, T>
     int Validate(OvmsWriter* writer, int argc, const char* token, bool complete) const
       {
       if (complete)
-	{
-	if (!GetCompletion(writer, token))
-	  return -1;
-	}
+        {
+        if (!GetCompletion(writer, token))
+          return -1;
+        }
       else
-	{
-	if (FindUniquePrefix(token) == NULL)
-	  {
+        {
+        if (FindUniquePrefix(token) == NULL)
+          {
           if (strcmp(token, "?") != 0)
             writer->printf("Error: %s is not defined\n", token);
-	  return -1;
-	  }
-	}
+          return -1;
+          }
+        }
       return argc;
       }
   };
@@ -167,17 +197,17 @@ class CNameMap : public std::map<const char*, T, CmpStrOp>
       size_t len = strlen(token);
       const T* found = NULL;
       for (typename CNameMap<T>::const_iterator it = CNameMap<T>::begin(); it != CNameMap<T>::end(); ++it)
-	{
-	if (strncmp(it->first, token, len) == 0)
-	  {
-	  if (len == strlen(it->first))
-	    return &it->second;
-	  if (found)
-	    return NULL;
-	  else
-	    found = &it->second;
-	  }
-	}
+        {
+        if (strncmp(it->first, token, len) == 0)
+          {
+          if (len == strlen(it->first))
+            return &it->second;
+          if (found)
+            return NULL;
+          else
+            found = &it->second;
+          }
+        }
       return found;
       }
 
@@ -204,19 +234,19 @@ class CNameMap : public std::map<const char*, T, CmpStrOp>
     int Validate(OvmsWriter* writer, int argc, const char* token, bool complete) const
       {
       if (complete)
-	{
-	if (!GetCompletion(writer, token))
-	  return -1;
-	}
+        {
+        if (!GetCompletion(writer, token))
+          return -1;
+        }
       else
-	{
-	if (FindUniquePrefix(token) == NULL)
-	  {
+        {
+        if (FindUniquePrefix(token) == NULL)
+          {
           if (strcmp(token, "?") != 0)
             writer->printf("Error: %s is not defined\n", token);
-	  return -1;
-	  }
-	}
+          return -1;
+          }
+        }
       return argc;
       }
   };
@@ -321,8 +351,10 @@ class OvmsCommandTask : public TaskBase
     virtual OvmsCommandState_t Prepare();
     bool Run();
     static bool Terminator(OvmsWriter* writer, void* userdata, char ch);
+    static void TerminationHandler(OvmsWriter* writer, void* userdata);
     bool IsRunning() { return m_state == OCS_RunLoop; }
     bool IsTerminated() { return m_state == OCS_StopRequested; }
+    void RequestStop() { m_state = OCS_StopRequested; }
 
   protected:
     int verbosity;
@@ -330,7 +362,7 @@ class OvmsCommandTask : public TaskBase
     OvmsCommand* cmd;
     int argc;
     char** argv;
-    OvmsCommandState_t m_state;
+    volatile OvmsCommandState_t m_state;
   };
 
 class OvmsCommandApp : public OvmsWriter
@@ -353,7 +385,6 @@ class OvmsCommandApp : public OvmsWriter
     void DeregisterConsole(OvmsWriter* writer);
     int Log(const char* fmt, ...) __attribute__ ((format (printf, 2, 3)));
     int Log(const char* fmt, va_list args) __attribute__ ((format (printf, 2, 0)));
-    int LogPartial(const char* fmt, ...) __attribute__ ((format (printf, 2, 3)));
     int HexDump(const char* tag, const char* prefix, const char* data, size_t length, size_t colsize=16);
     void Display(OvmsWriter* writer);
 
@@ -389,13 +420,16 @@ class OvmsCommandApp : public OvmsWriter
 
   private:
     OvmsCommand m_root;
+
     typedef std::set<OvmsWriter*> ConsoleSet;
-    ConsoleSet m_consoles;
-    PartialLogs m_partials;
+    ConsoleSet m_consoles;                          // set of registered consoles (= log receivers)
+    OvmsMutex m_consoles_mutex;                     // m_consoles access synchronization
+
     FILE* m_logfile;
     std::string m_logfile_path;
     size_t m_logfile_size;
     size_t m_logfile_maxsize;
+    int m_logfile_syncperiod;
     TaskHandle_t m_logtask;
     OvmsMutex m_logtask_mutex;
     QueueHandle_t m_logtask_queue;

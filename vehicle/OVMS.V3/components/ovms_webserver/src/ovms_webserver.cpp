@@ -72,6 +72,8 @@ OvmsWebServer::OvmsWebServer()
   m_client_backlog = xQueueCreate(50, sizeof(WebSocketTxTodo));
   m_update_ticker = xTimerCreate("Web client update ticker", 250 / portTICK_PERIOD_MS, pdTRUE, NULL, UpdateTicker);
 
+  m_tick = 0;
+
   MyConfig.RegisterParam("http.server", "Webserver configuration", true, true);
   MyConfig.RegisterParam("http.plugin", "Webserver plugins", true, true);
 
@@ -109,6 +111,7 @@ OvmsWebServer::OvmsWebServer()
   // register standard administration pages:
   RegisterPage("/status", "Status", HandleStatus, PageMenu_Main, PageAuth_Cookie);
   RegisterPage("/shell", "Shell", HandleShell, PageMenu_Tools, PageAuth_Cookie);
+  RegisterPage("/metrics", "Metrics", HandleMetrics, PageMenu_Tools, PageAuth_Cookie);
   RegisterPage("/edit", "Editor", HandleEditor, PageMenu_Tools, PageAuth_Cookie);
 
   // CAN frame monitor
@@ -121,7 +124,7 @@ OvmsWebServer::OvmsWebServer()
   RegisterPage("/cfg/vehicle", "Vehicle", HandleCfgVehicle, PageMenu_Config, PageAuth_Cookie);
   RegisterPage("/cfg/wifi", "Wifi", HandleCfgWifi, PageMenu_Config, PageAuth_Cookie);
 #ifdef CONFIG_OVMS_COMP_CELLULAR
-  RegisterPage("/cfg/cellular", "Cellular / GPS", HandleCfgModem, PageMenu_Config, PageAuth_Cookie);
+  RegisterPage("/cfg/cellular", "Cellular / GPS", HandleCfgModem, PageMenu_Config, PageAuth_Cookie);    
 #endif
 #ifdef CONFIG_OVMS_COMP_SERVER
 #ifdef CONFIG_OVMS_COMP_SERVER_V2
@@ -140,6 +143,7 @@ OvmsWebServer::OvmsWebServer()
   RegisterPage("/cfg/autostart", "Autostart", HandleCfgAutoInit, PageMenu_Config, PageAuth_Cookie);
 #ifdef CONFIG_OVMS_COMP_OTA
   RegisterPage("/cfg/firmware", "Firmware", HandleCfgFirmware, PageMenu_Config, PageAuth_Cookie);
+  RegisterPage("/cfg/partitioning", "Partitioning", HandleCfgPartitioning, PageMenu_Config, PageAuth_Cookie);
 #endif
   RegisterPage("/cfg/logging", "Logging", HandleCfgLogging, PageMenu_Config, PageAuth_Cookie);
   RegisterPage("/cfg/locations", "Locations", HandleCfgLocations, PageMenu_Config, PageAuth_Cookie);
@@ -162,7 +166,14 @@ void OvmsWebServer::NetManInit(std::string event, void* data)
     ConfigChanged("config.mounted", NULL);
   }
 
+  auto mglock = MongooseLock();
   struct mg_mgr* mgr = MyNetManager.GetMongooseMgr();
+  if (!mgr)
+    {
+    ESP_LOGE(TAG, "Network manager is not available");
+    m_running = false;
+    return;
+    }
 
   char *error_string;
   struct mg_bind_opts bind_opts = {};
@@ -423,6 +434,7 @@ void PagePluginContent::LoadContent()
 
 void OvmsWebServer::RegisterPlugins()
 {
+  auto lock = MyConfig.Lock();
   OvmsConfigParam* cp = MyConfig.CachedParam("http.plugin");
   if (!cp)
     return;
@@ -598,6 +610,38 @@ void OvmsWebServer::EventHandler(mg_connection *nc, int ev, void *p)
       }
       break;
 
+#if MG_ENABLE_HTTP_STREAMING_MULTIPART && defined(CONFIG_OVMS_COMP_OTA)
+    case MG_EV_HTTP_MULTIPART_REQUEST:      // start of a streamed multipart upload
+      {
+        // No handler attached yet: dispatch by URI & re-check auth here, because
+        // multipart requests never pass through FindPage()/PageEntry::Serve().
+        struct http_message *hm = (struct http_message *) p;
+        std::string uri(hm->uri.p, hm->uri.len);
+        if (uri == "/api/firmware/upload") {
+          if (!MyWebServer.AuthorizeMultipart(hm)) {
+            ESP_LOGW(TAG, "Firmware upload: unauthorized");
+            mg_http_send_error(nc, 401, "Unauthorized");
+            nc->flags |= MG_F_SEND_AND_CLOSE;
+          }
+          else {
+            // The client passes the image size as ?size=<bytes> so the OTA layer
+            // erases only what's needed (faster start) instead of the whole partition:
+            size_t size = 0;
+            char sizebuf[24];
+            if (mg_get_http_var(&hm->query_string, "size", sizebuf, sizeof(sizebuf)) > 0)
+              size = (size_t) strtoul(sizebuf, NULL, 10);
+            ESP_LOGI(TAG, "Firmware upload: authorized, receiving image (size=%u)", (unsigned) size);
+            new HttpFirmwareUpload(nc, size);   // attaches itself to nc->user_data
+          }
+        }
+        else {
+          mg_http_send_error(nc, 404, "Not found");
+          nc->flags |= MG_F_SEND_AND_CLOSE;
+        }
+      }
+      break;
+#endif // MG_ENABLE_HTTP_STREAMING_MULTIPART && defined(CONFIG_OVMS_COMP_OTA)
+
     case MG_EV_CLOSE:                       // connection has been closed
       {
         if (handler) {
@@ -628,6 +672,7 @@ void OvmsWebServer::EventHandler(mg_connection *nc, int ev, void *p)
  */
 void PageEntry::Serve(PageContext_t& c)
 {
+  // Mongoose event handler context, MongooseLock not needed
   // check auth:
   if
 #if MG_ENABLE_FILESYSTEM
@@ -745,8 +790,15 @@ void MgHandler::RequestPoll()
     // we're in the NetManTask, can send directly:
     HandleEvent(MG_EV_POLL, NULL);
   } else {
+    auto mglock = MongooseLock();
+    struct mg_mgr* mgr = MyNetManager.GetMongooseMgr();
+    if (!mgr)
+      {
+      ESP_LOGE(TAG, "Network manager is not available");
+      return;
+      }
     MgHandler* origin = this;
-    mg_broadcast(MyNetManager.GetMongooseMgr(), HandlePoll, &origin, sizeof(origin));
+    mg_broadcast(mgr, HandlePoll, &origin, sizeof(origin));
   }
 #endif // MG_ENABLE_BROADCAST && WEBSRV_USE_MG_BROADCAST
 }
