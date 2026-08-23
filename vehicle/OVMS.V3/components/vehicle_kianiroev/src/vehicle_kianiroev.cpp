@@ -269,10 +269,13 @@ OvmsVehicleKiaNiroEv::OvmsVehicleKiaNiroEv()
 
   cmd_xkn->RegisterCommand("trunk","Open trunk", CommandOpenTrunk, "<pin>",1,1);
 
-  MyConfig.SetParamValueBool("modem","enable.gps", true);
-  MyConfig.SetParamValueBool("modem","enable.gpstime", true);
-  MyConfig.SetParamValueBool("modem","enable.net", true);
-  MyConfig.SetParamValueBool("modem","enable.sms", true);
+  {
+    auto lock = MyConfig.Lock();
+    MyConfig.SetParamValueBool("modem","enable.gps", true);
+    MyConfig.SetParamValueBool("modem","enable.gpstime", true);
+    MyConfig.SetParamValueBool("modem","enable.net", true);
+    MyConfig.SetParamValueBool("modem","enable.sms", true);
+  }
 
   // Require GPS.
   MyEvents.SignalEvent("vehicle.require.gps", NULL);
@@ -298,7 +301,7 @@ OvmsVehicleKiaNiroEv::OvmsVehicleKiaNiroEv()
   kia_secs_with_no_client=0;
   PollSetPidList(m_can1,vehicle_kianiroev_polls);
 
-  kn_range_calc = new RangeCalculator(1, 4, 455, 64);
+  kn_range_calc = new RangeCalculator(1, 4, 455, 64, 1);
   }
 
 /**

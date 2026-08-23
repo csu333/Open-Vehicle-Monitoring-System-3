@@ -33,11 +33,12 @@
 #define __WEBSERVER_H__
 
 #include <forward_list>
-#include <iterator>
 #include <vector>
-#include <memory>
 #include <utility>
 #include <map>
+#include <set>
+#include <string>
+#include <ostream>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
@@ -50,7 +51,9 @@
 #include "ovms_shell.h"
 #include "ovms_netmanager.h"
 #include "ovms_utils.h"
+
 #include "log_buffers.h"
+#include "vehicle.h"
 
 // The setup wizard currently is tailored to be used with a WiFi enabled module:
 #ifdef CONFIG_OVMS_COMP_WIFI
@@ -408,6 +411,7 @@ class WebSocketHandler : public MgHandler, public OvmsWriter
     void ProcessTxJob();
     int HandleEvent(int ev, void* p);
     void HandleIncomingMsg(std::string msg);
+    void LogStatus();
 
   public:
     void Subscribe(std::string topic);
@@ -427,10 +431,8 @@ class WebSocketHandler : public MgHandler, public OvmsWriter
     size_t                    m_modifier = 0;         // "our" metrics modifier
     size_t                    m_reader = 0;           // "our" notification reader id
     QueueHandle_t             m_jobqueue = NULL;
-    uint32_t                  m_jobqueue_overflow_status = 0;
-    uint32_t                  m_jobqueue_overflow_logged = 0;
     uint32_t                  m_jobqueue_overflow_dropcnt = 0;
-    uint32_t                  m_jobqueue_overflow_dropcntref = 0;
+    uint32_t                  m_jobqueue_overflow_logged = 0;
     WebSocketTxJob            m_job = {};
     int                       m_sent = 0;
     int                       m_ack = 0;
@@ -484,6 +486,39 @@ class HttpCommandStream : public OvmsShell, public MgHandler
 };
 
 
+#ifdef CONFIG_OVMS_COMP_OTA
+/**
+ * HttpFirmwareUpload: receive a streamed multipart firmware upload and flash it
+ *  directly into the inactive OTA partition (no SD card needed).
+ *
+ * Created by EventHandler() on an authorized MG_EV_HTTP_MULTIPART_REQUEST for the
+ *  upload endpoint; it then consumes the MG_EV_HTTP_PART_* events, feeding the
+ *  image to MyOTA.StreamFlash*(). The firmware part is the first part carrying a
+ *  filename; other form fields are ignored.
+ */
+class HttpFirmwareUpload : public MgHandler
+{
+  public:
+    HttpFirmwareUpload(mg_connection* nc, size_t expected_size = 0);
+    ~HttpFirmwareUpload();
+
+  public:
+    int HandleEvent(int ev, void* p);
+
+  protected:
+    void Respond(int code, const std::string& text);
+
+  protected:
+    bool                      m_flashing = false;     // a StreamFlash session is open
+    bool                      m_responded = false;    // HTTP response already sent
+    bool                      m_ok = false;           // image received & flashed
+    size_t                    m_expected = 0;         // image size from ?size= (0 = unknown)
+    size_t                    m_size = 0;             // bytes received for the image
+    std::string               m_target;               // target partition label (on success)
+};
+#endif // CONFIG_OVMS_COMP_OTA
+
+
 
 /**
  * OvmsWebServer: main web framework (static instance: MyWebServer)
@@ -491,7 +526,7 @@ class HttpCommandStream : public OvmsShell, public MgHandler
  * Register custom page handlers through the RegisterPage() API.
  */
 
-class OvmsWebServer : public ExternalRamAllocated
+class OvmsWebServer : public ExternalRamAllocated, MongooseClient
 {
   public:
     OvmsWebServer();
@@ -529,6 +564,11 @@ class OvmsWebServer : public ExternalRamAllocated
     user_session* GetSession(http_message *hm);
     void CheckSessions(void);
     static bool CheckLogin(std::string username, std::string password);
+#ifdef CONFIG_OVMS_COMP_OTA
+    // Authorize a multipart request (e.g. firmware upload). Multipart requests
+    // bypass PageEntry::Serve, so the cookie/apikey auth is re-checked here.
+    bool AuthorizeMultipart(http_message *hm);
+#endif
 
   public:
     WebSocketHandler* CreateWebSocketHandler(mg_connection* nc);
@@ -553,11 +593,13 @@ class OvmsWebServer : public ExternalRamAllocated
     static void HandleFile(PageEntry_t& p, PageContext_t& c);
     static void HandleShell(PageEntry_t& p, PageContext_t& c);
     static void HandleDashboard(PageEntry_t& p, PageContext_t& c);
+    static void HandleMetrics(PageEntry_t& p, PageContext_t& c);
     static void HandleBmsCellMonitor(PageEntry_t& p, PageContext_t& c);
     static void HandleCfgBrakelight(PageEntry_t& p, PageContext_t& c);
     static void HandleEditor(PageEntry_t& p, PageContext_t& c);
     static void HandleCfgPassword(PageEntry_t& p, PageContext_t& c);
-    static void HandleCfgVehicle(PageEntry_t& p, PageContext_t& c);
+    static void HandleCfgVehicle(PageEntry_t& p, PageContext_t& c);    
+    static void HandleCfgPreconditionSchedule(PageEntry_t& p, PageContext_t& c);
     static void HandleCfgModem(PageEntry_t& p, PageContext_t& c);
     static void HandleCfgServerV2(PageEntry_t& p, PageContext_t& c);
     static void HandleCfgServerV3(PageEntry_t& p, PageContext_t& c);
@@ -573,6 +615,7 @@ class OvmsWebServer : public ExternalRamAllocated
       std::string& warn, std::string& error, int pass_minlen);
     static void HandleCfgAutoInit(PageEntry_t& p, PageContext_t& c);
     static void HandleCfgFirmware(PageEntry_t& p, PageContext_t& c);
+    static void HandleCfgPartitioning(PageEntry_t& p, PageContext_t& c);
     static void HandleCfgLogging(PageEntry_t& p, PageContext_t& c);
     static void HandleCfgLocations(PageEntry_t& p, PageContext_t& c);
     static void HandleCfgBackup(PageEntry_t& p, PageContext_t& c);
@@ -616,6 +659,7 @@ class OvmsWebServer : public ExternalRamAllocated
 
     int                       m_init_timeout;
     int                       m_shutdown_countdown;
+    uint32_t                  m_tick;
 };
 
 extern OvmsWebServer MyWebServer;

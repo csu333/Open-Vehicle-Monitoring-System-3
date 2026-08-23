@@ -34,13 +34,14 @@
 #include "freertos/task.h"
 #include "ovms_console.h"
 #include "task_base.h"
+#include "mongoose_client.h"
 
 #define BUFFER_SIZE 512
 
 class ConsoleSSH;
 struct mg_connection;
 
-class OvmsSSH
+class OvmsSSH : public MongooseClient, public ConsoleReaper
   {
   public:
     OvmsSSH();
@@ -58,7 +59,7 @@ class OvmsSSH
     bool m_keyed;
   };
 
-class ConsoleSSH : public OvmsConsole
+class ConsoleSSH : public OvmsConsole, public MongooseClient
   {
   public:
     ConsoleSSH(OvmsSSH* server, struct mg_connection* nc);
@@ -79,6 +80,7 @@ class ConsoleSSH : public OvmsConsole
     ssize_t write(const void *buf, size_t nbyte);
     int RecvCallback(char* buf, uint32_t size);
     bool IsDraining() { return m_drain > 0; }
+    mg_connection* GetConnection() { return m_connection; }
 
   private:
     typedef struct {DIR* dir; size_t size;} Level;

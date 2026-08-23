@@ -50,6 +50,7 @@ static const char *TAG = "command";
 #include "ovms_utils.h"
 #include "ovms_script.h"
 #include "buffered_shell.h"
+#include "background_shell.h"
 #include "log_buffers.h"
 #include "ovms_semaphore.h"
 #include "ovms_vfs.h"
@@ -79,10 +80,89 @@ OvmsWriter::OvmsWriter()
   m_insert = NULL;
   m_userData = NULL;
   m_monitoring = false;
+  m_termination = NULL;
+  m_termData = NULL;
   }
 
 OvmsWriter::~OvmsWriter()
   {
+  // Backstop: clean up any interactive command still bound to this writer.
+  // Consoles that own a transport must call this earlier (before freeing that
+  // transport); here it only guards writers that did not.
+  RunTerminationCallback();
+  }
+
+// Guards the termination registration against a follow-mode task that
+// self-exits (and frees itself) concurrently with a teardown check-and-stop
+// (see StopFollowModeTask). File-scope on purpose: the spinlock must not live
+// inside OvmsWriter, because releasing it after the sentinel clear would touch
+// the writer again — the sentinel store must be the task's last writer access.
+static portMUX_TYPE termination_mux = portMUX_INITIALIZER_UNLOCKED;
+
+void OvmsWriter::RegisterTerminationCallback(TerminationCallback cb, void* ctx)
+  {
+  // Context first, sentinel last: a reader testing m_termination must find
+  // m_termData already valid.
+  m_termData = ctx;
+  m_termination = cb;
+  }
+
+void OvmsWriter::DeregisterTerminationCallback(TerminationCallback cb)
+  {
+  // The critical section pairs with StopFollowModeTask(). Context is cleared
+  // first, sentinel last: pollers (HasTerminationCallback, HasFollowModeTask)
+  // read the sentinel unlocked and treat NULL as "all writer accesses done".
+  portENTER_CRITICAL(&termination_mux);
+  if (m_termination == cb)
+    {
+    m_termData = NULL;
+    m_termination = NULL;
+    }
+  portEXIT_CRITICAL(&termination_mux);
+  }
+
+void OvmsWriter::RunTerminationCallback()
+  {
+  // Invoked during console/writer teardown. Gives the active interactive
+  // command (if any) a chance to release resources / stop background tasks
+  // while this writer is still valid; the handler blocks until that is done.
+  // Idempotent: a follow-mode task clears its own registration before this
+  // returns, and the explicit clear afterwards makes repeat calls (e.g. a
+  // console destructor followed by the ~OvmsWriter backstop) a no-op.
+  TerminationCallback cb = m_termination;
+  void* data = m_termData;
+  if (cb == NULL)
+    return;
+  cb(this, data);
+  m_termData = NULL;
+  m_termination = NULL;
+  }
+
+bool OvmsWriter::HasFollowModeTask()
+  {
+  // True iff the active termination handler is OvmsCommandTask's, i.e. a
+  // follow-mode task is still running (it clears the registration as its last
+  // writer access before freeing itself). Sentinel test only — callers must
+  // not dereference the task; use StopFollowModeTask() for that.
+  return (m_termination == OvmsCommandTask::TerminationHandler);
+  }
+
+bool OvmsWriter::StopFollowModeTask()
+  {
+  // Atomically check for a bound follow-mode task and request it to stop.
+  // The task may self-exit (e.g. "vfs tail" losing its file) and free itself
+  // at any time, so the registration test and the stop request must be one
+  // unit: while the registration is held under the mux the task cannot have
+  // entered its deregistration yet, hence cannot have freed itself.
+  bool stopped = false;
+  portENTER_CRITICAL(&termination_mux);
+  if (m_termination == OvmsCommandTask::TerminationHandler)
+    {
+    ((OvmsCommandTask*) m_termData)->RequestStop();
+    stopped = true;
+    }
+  portEXIT_CRITICAL(&termination_mux);
+  return stopped;
   }
 
 void OvmsWriter::Exit()
@@ -437,6 +517,7 @@ void OvmsCommand::Execute(int verbosity, OvmsWriter* writer, int argc, const cha
   if (m_execute && (m_children.empty() || argc == 0))
     {
     //puts("Executing directly...");
+    writer->SetCommand(this);
     if (argc < m_min || argc > m_max || (argc > 0 && strcmp(argv[argc-1],"?")==0))
       {
       PutUsage(writer);
@@ -455,9 +536,10 @@ void OvmsCommand::Execute(int verbosity, OvmsWriter* writer, int argc, const cha
       int used = m_validate(writer, this, argc > m_max ? m_max : argc, argv, false);
       if (used < 0)
         {
+        writer->SetCommand(this);
         if (argc > 0 && strcmp(argv[argc-1],"?") != 0)
           writer->puts("Unrecognised command");
-	PutUsage(writer);
+        PutUsage(writer);
         return;
         }
       argc -= used;
@@ -466,6 +548,7 @@ void OvmsCommand::Execute(int verbosity, OvmsWriter* writer, int argc, const cha
     //puts("Looking for a matching command");
     if (argc <= 0)
       {
+      writer->SetCommand(this);
       if (m_execute)
         {
         if ((!m_secure)||(m_secure && writer->m_issecure))
@@ -480,6 +563,7 @@ void OvmsCommand::Execute(int verbosity, OvmsWriter* writer, int argc, const cha
       }
     if (strcmp(argv[0],"?")==0)
       {
+      writer->SetCommand(this);
       // Skip usage line if it's just the one-line list of children.
       if (m_usage_template.empty() || m_execute)
         PutUsage(writer);
@@ -501,11 +585,13 @@ void OvmsCommand::Execute(int verbosity, OvmsWriter* writer, int argc, const cha
     OvmsCommand* cmd = m_children.FindUniquePrefix(argv[0]);
     if (!cmd)
       {
+      writer->SetCommand(this);
       writer->puts("Unrecognised command");
       if (GetParent())    // No usage line for root command
         PutUsage(writer);
       return;
       }
+    // Continue in sub command:
     cmd->Execute(verbosity,writer,argc-1,++argv);
     }
   }
@@ -676,6 +762,13 @@ typedef struct
   int tries;
   } PasswordContext;
 
+// Release the password prompt context if the session is closed while "enable"
+// is still waiting for input (the insert callback would otherwise leak it).
+void enableTerminate(OvmsWriter* writer, void* v)
+  {
+  delete (PasswordContext*)v;
+  }
+
 bool enableInsert(OvmsWriter* writer, void* v, char ch)
   {
   PasswordContext* pc = (PasswordContext*)v;
@@ -686,6 +779,7 @@ bool enableInsert(OvmsWriter* writer, void* v, char ch)
       {
       writer->SetSecure(true);
       writer->printf("\nSecure mode");
+      writer->DeregisterTerminationCallback(enableTerminate);
       delete pc;
       return false;
       }
@@ -693,6 +787,7 @@ bool enableInsert(OvmsWriter* writer, void* v, char ch)
       {
       writer->printf("\nError: %d incorrect password attempts", pc->tries);
       vTaskDelay(5000 / portTICK_PERIOD_MS);
+      writer->DeregisterTerminationCallback(enableTerminate);
       delete pc;
       return false;
       }
@@ -702,6 +797,7 @@ bool enableInsert(OvmsWriter* writer, void* v, char ch)
     }
   if (ch == 'C'-0100)
     {
+    writer->DeregisterTerminationCallback(enableTerminate);
     delete pc;
     return false;
     }
@@ -729,6 +825,7 @@ void enable(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc, const
     pc->tries = 0;
     writer->printf("Password:");
     writer->RegisterInsertCallback(enableInsert, pc);
+    writer->RegisterTerminationCallback(enableTerminate, pc);
     }
   }
 
@@ -751,6 +848,87 @@ void cmd_echo(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc, con
     writer->puts(argv[i]);
   if (!i)
     writer->puts("");
+  }
+
+void cmd_run(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc, const char* const* argv)
+  {
+  int i;
+  int stacksize = CONFIG_OVMS_SYS_COMMAND_STACK_SIZE;
+  UBaseType_t priority = CONFIG_OVMS_SYS_COMMAND_PRIORITY;
+  char notify_mode = 'i';
+
+  // parse options:
+  for (i = 0; i < argc; i++)
+    {
+    if (argv[i][0] != '-')
+      break;
+    else if (argv[i][1] == 'n')
+      notify_mode = argv[i][2];
+    else if (argv[i][1] == 'S')
+      stacksize = atoi(argv[i]+2);
+    else if (argv[i][1] == 'P')
+      priority = atoi(argv[i]+2);
+    else
+      {
+      writer->printf("ERROR: unknown option: %s\n", argv[i]);
+      cmd->PutUsage(writer);
+      return;
+      }
+    }
+
+  // validate args:
+  if (i == argc)
+    {
+    writer->puts("ERROR: no command");
+    return;
+    }
+  if (stacksize < 512) stacksize = 512;
+  if (priority > 23) priority = 23;
+
+  // start background shell:
+  BackgroundShell* bs = new BackgroundShell("OVMS BgShell", verbosity, stacksize, priority);
+  if (bs)
+    {
+    bs->SetSecure(true); // safe to assume, the run command is only available in secure mode
+    bs->SetNotifyMode(notify_mode);
+    }
+  if (!bs || !bs->Init())
+    {
+    writer->puts("ERROR: out of memory");
+    return;
+    }
+
+  // send command(s) to background shell:
+  char quotechar = 0;
+  for (; i < argc; i++)
+    {
+    if (argv[i][0] == ';' && argv[i][1] == 0)
+      {
+      // translate single ';' into command separation:
+      bs->QueueChar('\n');
+      }
+    else
+      {
+      // quote argument if necessary:
+      if (strchr(argv[i], ' '))
+        {
+        quotechar = (strchr(argv[i], '"')) ? '\'' : '"';
+        bs->QueueChar(quotechar);
+        }
+      bs->QueueChars(argv[i]);
+      if (quotechar)
+        {
+        bs->QueueChar(quotechar);
+        quotechar = 0;
+        }
+      if (i < argc-1) bs->QueueChar(' ');
+      }
+    }
+  
+  // terminate background shell after last command:
+  bs->QueueChars("\nexit\n");
+  
+  writer->puts("Background execution started.");
   }
 
 #ifdef CONFIG_OVMS_SC_JAVASCRIPT_DUKTAPE
@@ -828,6 +1006,7 @@ OvmsCommandApp::OvmsCommandApp()
   m_logfile_path = "";
   m_logfile_size = 0;
   m_logfile_maxsize = 0;
+  m_logfile_syncperiod = 3;
   m_logtask = NULL;
   m_logtask_queue = NULL;
   m_logtask_dropcnt = 0;
@@ -836,7 +1015,7 @@ OvmsCommandApp::OvmsCommandApp()
 
   m_root.RegisterCommand("help", "Ask for help", help, "", 0, 0, false);
   m_root.RegisterCommand("exit", "End console session", cmd_exit, "", 0, 0, false);
-  OvmsCommand* cmd_log = MyCommandApp.RegisterCommand("log","LOG framework", log_status, "", 0, 0, false);
+  OvmsCommand* cmd_log = m_root.RegisterCommand("log","LOG framework", log_status, "", 0, 0, false);
   cmd_log->RegisterCommand("file", "Start logging to specified file", log_file, "[<vfspath>]\nDefault: config log[file.path]", 0, 1, true, vfs_file_validate);
   cmd_log->RegisterCommand("open", "Start file logging", log_open);
   cmd_log->RegisterCommand("close", "Stop file logging", log_close);
@@ -858,6 +1037,16 @@ OvmsCommandApp::OvmsCommandApp()
     "<seconds>\nFractions of seconds are supported, e.g. 0.2 = 200 ms", 1, 1);
   m_root.RegisterCommand("echo", "Script utility: output text", cmd_echo,
     "[<text>] […]\nOutputs up to 10 arguments as separate lines, just a newline if no text is given.", 0, 10);
+  m_root.RegisterCommand("run", "Run command(s) in background task", cmd_run,
+    "[-n<i|o|s>] [-S<stacksize>] [-P<priority>] <command…> [; <command…>]\n"
+    "Run command(s) in background task (log tag: 'bgshell'), send output via notification.\n"
+    "Use a single ';' to separate multiple commands.\n"
+    "Notification default mode (type) is 'info' (-ni), -ns = 'stream', -no = off.\n"
+    "Notification subtype scheme: 'cmd.full.command.name'\n"
+    "Default task stacksize is " STR(CONFIG_OVMS_SYS_COMMAND_STACK_SIZE)
+    ", default task priority is " STR(CONFIG_OVMS_SYS_COMMAND_PRIORITY) "."
+    , 1, 1000, true);
+
 
 #ifdef CONFIG_OVMS_SC_JAVASCRIPT_DUKTAPE
   ESP_LOGI(TAG, "Expanding DUKTAPE javascript engine");
@@ -959,15 +1148,31 @@ OvmsCommand* OvmsCommandApp::FindCommandFullName(const char* name, bool allow_cr
   return found;
   }
 
+
+/**
+ * Registry of active console instances (= log receivers)
+ */
 void OvmsCommandApp::RegisterConsole(OvmsWriter* writer)
   {
+  OvmsMutexLock consoles_lock(&m_consoles_mutex);
   m_consoles.insert(writer);
   }
 
 void OvmsCommandApp::DeregisterConsole(OvmsWriter* writer)
   {
+  OvmsMutexLock consoles_lock(&m_consoles_mutex);
   m_consoles.erase(writer);
   }
+
+
+/**
+ * OvmsCommandApp::Log: this is the central entry point for all log messages via the ESP log framework
+ *    (… called by ConsoleAsync::ConsoleLogger()
+ *     … registered by ConsoleAsync::Service() as the esp-idf log printf (via esp_log_set_vprintf()))
+ * 
+ * Log messages are stored in LogBuffers instances (shared memory pointer management),
+ *    with each listener decrementing the share count, last release freeing the log message.
+ */
 
 int OvmsCommandApp::Log(const char* fmt, ...)
   {
@@ -980,46 +1185,26 @@ int OvmsCommandApp::Log(const char* fmt, ...)
 
 int OvmsCommandApp::Log(const char* fmt, va_list args)
   {
-  LogBuffers* lb;
-  TaskHandle_t task = xTaskGetCurrentTaskHandle();
-  PartialLogs::iterator it = m_partials.find(task);
-  if (it == m_partials.end())
-    lb = new LogBuffers();
-  else
-    {
-    lb = it->second;
-    m_partials.erase(task);
-    }
+  // format & store the log message:
+  LogBuffers* lb = new LogBuffers();
+  assert(lb);
   int ret = LogBuffer(lb, fmt, args);
+
+  // send the log message to all registered consoles:
+  OvmsMutexLock consoles_lock(&m_consoles_mutex);
   lb->set(m_consoles.size());
   for (ConsoleSet::iterator it = m_consoles.begin(); it != m_consoles.end(); ++it)
     {
     (*it)->Log(lb);
     }
+
   return ret;
   }
 
-int OvmsCommandApp::LogPartial(const char* fmt, ...)
-  {
-  LogBuffers* lb;
-  TaskHandle_t task = xTaskGetCurrentTaskHandle();
-  PartialLogs::iterator it = m_partials.find(task);
-  if (it == m_partials.end())
-    {
-    lb = new LogBuffers();
-    m_partials[task] = lb;
-    }
-  else
-    {
-    lb = it->second;
-    }
-  va_list args;
-  va_start(args, fmt);
-  int ret = LogBuffer(lb, fmt, args);
-  va_end(args);
-  return ret;
-  }
-
+/**
+ * OvmsCommandApp::LogBuffer: internal printf utility for Log()
+ *    (format log message & add to LogBuffers instance)
+ */
 int OvmsCommandApp::LogBuffer(LogBuffers* lb, const char* fmt, va_list args)
   {
   char *buffer;
@@ -1076,6 +1261,7 @@ char ** OvmsCommandApp::Complete(OvmsWriter* writer, int argc, const char * cons
 
 void OvmsCommandApp::Execute(int verbosity, OvmsWriter* writer, int argc, const char * const * argv)
   {
+  writer->SetCommand(nullptr);
   if (argc == 0)
     {
     writer->puts("Error: Empty command unrecognised");
@@ -1124,7 +1310,7 @@ void OvmsCommandApp::LogTask()
 
   // syncperiod: 0 = never, <0 = every n lines, >0 = after n/2 seconds idle
   uint32_t linecnt_synced = 0;
-  int syncperiod = MyConfig.GetParamValueInt("log", "file.syncperiod", 3);
+  int syncperiod = m_logfile_syncperiod;
   TickType_t timeout = (syncperiod<=0) ? portMAX_DELAY : pdMS_TO_TICKS(syncperiod*500);
 
   for (;;)
@@ -1238,6 +1424,8 @@ void OvmsCommandApp::LogTask()
   m_logtask = NULL;
   if (cmd.type == LogTaskCmd::LTC_Exit && cmd.data.cmdack)
     cmd.data.cmdack->Give();
+  uint32_t minstackfree = uxTaskGetStackHighWaterMark(NULL);
+  ESP_LOGD(TAG, "LogTask done, min stack free=%u", minstackfree);
   vTaskDelete(NULL);
   }
 
@@ -1527,6 +1715,8 @@ void OvmsCommandApp::ExpireTask(void* data)
   int keepdays = MyConfig.GetParamValueInt("log", "file.keepdays", 30);
   MyCommandApp.ExpireLogFiles(0, NULL, keepdays);
   MyCommandApp.m_expiretask = 0;
+  uint32_t minstackfree = uxTaskGetStackHighWaterMark(NULL);
+  ESP_LOGD(TAG, "ExpireTask done, min stack free=%u", minstackfree);
   vTaskDelete(NULL);
   }
 
@@ -1584,13 +1774,15 @@ void OvmsCommandApp::EventHandler(std::string event, void* data)
 
 void OvmsCommandApp::ReadConfig()
   {
+  auto lock = MyConfig.Lock();
   OvmsConfigParam* param = MyConfig.CachedParam("log");
+  if (!param) return;
 
   // configure log levels:
   std::string level = MyConfig.GetParamValue("log", "level");
   if (!level.empty())
     SetLoglevel("*", level);
-  for (auto const& kv : param->m_map)
+  for (auto const& kv : param->m_instances)
     {
     if (startsWith(kv.first, "level.") && !kv.second.empty())
       SetLoglevel(kv.first.substr(6), kv.second);
@@ -1598,6 +1790,7 @@ void OvmsCommandApp::ReadConfig()
 
   // configure log file:
   m_logfile_maxsize = MyConfig.GetParamValueInt("log", "file.maxsize", 1024);
+  m_logfile_syncperiod = MyConfig.GetParamValueInt("log", "file.syncperiod", 3);
   if (MyConfig.GetParamValueBool("log", "file.enable", false) == true)
     SetLogfile(MyConfig.GetParamValue("log", "file.path"));
   }
@@ -1641,8 +1834,13 @@ bool OvmsCommandTask::Run()
     case OCS_RunLoop:
       // start task:
       writer->RegisterInsertCallback(Terminator, (void*) this);
+      // Register the termination handler before Instantiate() so a console
+      // tearing down can never miss the task (it could otherwise start, finish
+      // and deregister itself before we registered it).
+      writer->RegisterTerminationCallback(TerminationHandler, (void*) this);
       if (!Instantiate())
         {
+        writer->DeregisterTerminationCallback(TerminationHandler);
         delete this;
         return false;
         }
@@ -1669,6 +1867,9 @@ OvmsCommandTask::~OvmsCommandTask()
   if (m_state == OCS_StopRequested)
     writer->puts("^C");
   writer->DeregisterInsertCallback(Terminator);
+  // Must be the last access to writer: it releases a console blocked in
+  // RunTerminationCallback(), which may then free the writer.
+  writer->DeregisterTerminationCallback(TerminationHandler);
   if (argv)
     {
     for (int i=0; i < argc; i++)
@@ -1682,6 +1883,22 @@ bool OvmsCommandTask::Terminator(OvmsWriter* writer, void* userdata, char ch)
   if (ch == 3) // Ctrl-C
     ((OvmsCommandTask*) userdata)->m_state = OCS_StopRequested;
   return true;
+  }
+
+void OvmsCommandTask::TerminationHandler(OvmsWriter* writer, void* userdata)
+  {
+  // Called on the console's teardown task when the session is closing while a
+  // follow-mode (OCS_RunLoop) task is still running. Ask it to stop, then wait
+  // until it has fully exited: ~OvmsCommandTask deregisters this handler as its
+  // last access to the writer, so once the registration is cleared the task can
+  // no longer dereference the writer. Cooperative stop+join (no vTaskDelete) so
+  // the task is never force-killed mid-write. userdata is deliberately not
+  // dereferenced — the task may have self-exited and freed itself since the
+  // handler was looked up; StopFollowModeTask() revalidates atomically.
+  if (!writer->StopFollowModeTask())
+    return;
+  while (writer->HasTerminationCallback(TerminationHandler))
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
 
 bool option_completer_t::check_param(char param, bool has_more)
